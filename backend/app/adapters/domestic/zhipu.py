@@ -19,6 +19,9 @@ from app.adapters.base import (
     EmbeddingResponse,
     MessageRole,
     StreamChunk,
+    ThinkingConfig,
+    ThinkingContent,
+    ThinkingMode,
     Usage,
 )
 from app.adapters.registry import AdapterRegistry, register_adapter
@@ -39,8 +42,18 @@ ZHIPU_MODELS = [
     "glm-4-long",
     "glm-4v",
     "glm-3-turbo",
+    "glm-z1-air",
+    "glm-z1-airx",
+    "glm-z1-flash",
     "embedding-2",
     "embedding-3",
+]
+
+# Thinking-capable models (GLM-Z1 series)
+THINKING_MODELS = [
+    "glm-z1-air",
+    "glm-z1-airx",
+    "glm-z1-flash",
 ]
 
 
@@ -71,6 +84,11 @@ class ZhipuAdapter(BaseAdapter):
                 "Content-Type": "application/json",
             },
         )
+
+    def _is_thinking_model(self, model: str) -> bool:
+        """Check if model supports thinking/reasoning."""
+        model_lower = model.lower()
+        return any(m in model_lower for m in ["glm-z1"])
 
     async def chat_completion(
         self, request: ChatCompletionRequest
@@ -104,6 +122,12 @@ class ZhipuAdapter(BaseAdapter):
                     }}
                     for t in request.tools
                 ]
+
+            # Add thinking parameters for GLM-Z1 models
+            if request.thinking and request.thinking.mode == ThinkingMode.ENABLED:
+                if self._is_thinking_model(request.model):
+                    thinking_params = request.thinking.to_zhipu_format()
+                    body.update(thinking_params)
 
             response = await self._client.post(
                 f"{self.base_url}/chat/completions",
@@ -233,14 +257,25 @@ class ZhipuAdapter(BaseAdapter):
     def _parse_response(
         self, result: dict[str, Any], model: str, latency_ms: float
     ) -> ChatCompletionResponse:
-        """Parse Zhipu response (OpenAI-compatible)."""
+        """Parse Zhipu response (OpenAI-compatible) with thinking support."""
         choices = []
         for idx, choice in enumerate(result.get("choices", [])):
             msg = choice.get("message", {})
+
+            # Extract thinking/reasoning content
+            thinking = None
+            reasoning_content = msg.get("reasoning_content")
+            if reasoning_content:
+                thinking = ThinkingContent(
+                    content=reasoning_content,
+                    metadata={"source": "zhipu"}
+                )
+
             message = ChatMessage(
                 role=MessageRole.ASSISTANT,
                 content=msg.get("content", ""),
                 tool_calls=msg.get("tool_calls"),
+                thinking=thinking,
             )
             choices.append(ChatCompletionChoice(
                 index=idx,
@@ -267,10 +302,11 @@ class ZhipuAdapter(BaseAdapter):
     def _parse_stream_chunk(
         self, chunk: dict[str, Any], request_id: str, model: str
     ) -> StreamChunk:
-        """Parse streaming chunk."""
+        """Parse streaming chunk with thinking support."""
         choices = chunk.get("choices", [])
         delta = {}
         finish_reason = None
+        thinking_delta = None
 
         if choices:
             choice = choices[0]
@@ -281,12 +317,17 @@ class ZhipuAdapter(BaseAdapter):
                 delta["role"] = d["role"]
             finish_reason = choice.get("finish_reason")
 
+            # Extract thinking delta
+            if d.get("reasoning_content"):
+                thinking_delta = d["reasoning_content"]
+
         return StreamChunk(
             id=chunk.get("id", request_id),
             model=chunk.get("model", model),
             delta=delta,
             finish_reason=finish_reason,
             provider=self.provider,
+            thinking_delta=thinking_delta,
         )
 
     async def close(self) -> None:

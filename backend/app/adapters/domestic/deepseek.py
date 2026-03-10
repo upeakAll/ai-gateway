@@ -20,6 +20,9 @@ from app.adapters.base import (
     EmbeddingResponse,
     MessageRole,
     StreamChunk,
+    ThinkingConfig,
+    ThinkingContent,
+    ThinkingMode,
     Usage,
 )
 from app.adapters.registry import AdapterRegistry, register_adapter
@@ -67,7 +70,7 @@ class DeepSeekAdapter(BaseAdapter):
     async def chat_completion(
         self, request: ChatCompletionRequest
     ) -> ChatCompletionResponse:
-        """Execute chat completion using DeepSeek."""
+        """Execute chat completion using DeepSeek with thinking support."""
         start_time = time.time()
 
         try:
@@ -95,16 +98,30 @@ class DeepSeekAdapter(BaseAdapter):
                     for t in request.tools
                 ]
 
+            # Add thinking parameters for deepseek-reasoner
+            if request.model == "deepseek-reasoner" and request.thinking:
+                thinking_params = request.thinking.to_deepseek_format()
+                request_params.update(thinking_params)
+
             response = await self.client.chat.completions.create(**request_params)
 
             latency_ms = (time.time() - start_time) * 1000
 
             choices = []
             for idx, choice in enumerate(response.choices):
+                # Extract thinking content from reasoning_content
+                thinking = None
+                if hasattr(choice.message, 'reasoning_content') and choice.message.reasoning_content:
+                    thinking = ThinkingContent(
+                        content=choice.message.reasoning_content,
+                        metadata={"source": "deepseek"}
+                    )
+
                 message = ChatMessage(
                     role=MessageRole(choice.message.role),
                     content=choice.message.content or "",
                     tool_calls=self._convert_tool_calls(choice.message.tool_calls),
+                    thinking=thinking,
                 )
                 choices.append(ChatCompletionChoice(
                     index=idx,
@@ -117,6 +134,12 @@ class DeepSeekAdapter(BaseAdapter):
                 completion_tokens=response.usage.completion_tokens,
                 total_tokens=response.usage.total_tokens,
             )
+
+            # Check for prompt_tokens_details (DeepSeek specific)
+            if hasattr(response.usage, 'prompt_tokens_details'):
+                usage.metadata = {
+                    "cached_tokens": getattr(response.usage.prompt_tokens_details, 'cached_tokens', 0),
+                }
 
             return ChatCompletionResponse(
                 id=response.id,
@@ -139,7 +162,7 @@ class DeepSeekAdapter(BaseAdapter):
     async def chat_completion_stream(
         self, request: ChatCompletionRequest
     ) -> AsyncIterator[StreamChunk]:
-        """Execute streaming chat completion."""
+        """Execute streaming chat completion with thinking support."""
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
         try:
@@ -157,12 +180,18 @@ class DeepSeekAdapter(BaseAdapter):
             if request.max_tokens:
                 request_params["max_tokens"] = request.max_tokens
 
+            # Add thinking parameters for deepseek-reasoner
+            if request.model == "deepseek-reasoner" and request.thinking:
+                thinking_params = request.thinking.to_deepseek_format()
+                request_params.update(thinking_params)
+
             stream = await self.client.chat.completions.create(**request_params)
 
             async for chunk in stream:
                 delta = {}
                 finish_reason = None
                 usage = None
+                thinking_delta = None
 
                 if chunk.choices:
                     choice = chunk.choices[0]
@@ -171,6 +200,9 @@ class DeepSeekAdapter(BaseAdapter):
                             delta["content"] = choice.delta.content
                         if choice.delta.role:
                             delta["role"] = choice.delta.role
+                        # Extract thinking delta
+                        if hasattr(choice.delta, 'reasoning_content') and choice.delta.reasoning_content:
+                            thinking_delta = choice.delta.reasoning_content
                     if choice.finish_reason:
                         finish_reason = choice.finish_reason
 
@@ -188,6 +220,7 @@ class DeepSeekAdapter(BaseAdapter):
                     finish_reason=finish_reason,
                     usage=usage,
                     provider=self.provider,
+                    thinking_delta=thinking_delta,
                 )
 
         except Exception as e:

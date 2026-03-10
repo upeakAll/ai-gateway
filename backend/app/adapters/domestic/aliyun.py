@@ -19,6 +19,9 @@ from app.adapters.base import (
     EmbeddingResponse,
     MessageRole,
     StreamChunk,
+    ThinkingConfig,
+    ThinkingContent,
+    ThinkingMode,
     Usage,
 )
 from app.adapters.registry import AdapterRegistry, register_adapter
@@ -41,9 +44,21 @@ ALIYUN_MODELS = [
     "qwen-vl-max",
     "qwen-vl-plus",
     "qwen-audio-turbo",
+    "qwq-plus",
+    "qwq-plus-latest",
+    "qwq-max",
+    "qwq-max-latest",
     "text-embedding-v1",
     "text-embedding-v2",
     "text-embedding-v3",
+]
+
+# Thinking-capable models (QwQ series)
+THINKING_MODELS = [
+    "qwq-plus",
+    "qwq-plus-latest",
+    "qwq-max",
+    "qwq-max-latest",
 ]
 
 
@@ -78,6 +93,11 @@ class AliyunAdapter(BaseAdapter):
             },
         )
 
+    def _is_thinking_model(self, model: str) -> bool:
+        """Check if model supports thinking/reasoning."""
+        model_lower = model.lower()
+        return any(m in model_lower for m in ["qwq-"])
+
     async def chat_completion(
         self, request: ChatCompletionRequest
     ) -> ChatCompletionResponse:
@@ -111,6 +131,12 @@ class AliyunAdapter(BaseAdapter):
 
             if request.stop:
                 body["parameters"]["stop"] = request.stop
+
+            # Add thinking parameters for QwQ models
+            if request.thinking and request.thinking.mode == ThinkingMode.ENABLED:
+                if self._is_thinking_model(request.model):
+                    thinking_params = request.thinking.to_aliyun_format()
+                    body["parameters"].update(thinking_params)
 
             response = await self._client.post(
                 f"{self.base_url}/services/aigc/text-generation/generation",
@@ -264,16 +290,27 @@ class AliyunAdapter(BaseAdapter):
     def _parse_response(
         self, result: dict[str, Any], model: str, latency_ms: float
     ) -> ChatCompletionResponse:
-        """Parse Aliyun response."""
+        """Parse Aliyun response with thinking support."""
         output = result.get("output", {})
         choices_data = output.get("choices", [])
 
         choices = []
         for idx, choice in enumerate(choices_data):
             message_data = choice.get("message", {})
+
+            # Extract thinking/reasoning content
+            thinking = None
+            reasoning_content = message_data.get("reasoning_content") or output.get("reasoning_content")
+            if reasoning_content:
+                thinking = ThinkingContent(
+                    content=reasoning_content,
+                    metadata={"source": "aliyun"}
+                )
+
             message = ChatMessage(
                 role=MessageRole.ASSISTANT,
                 content=message_data.get("content", ""),
+                thinking=thinking,
             )
             choices.append(ChatCompletionChoice(
                 index=idx,
@@ -305,12 +342,13 @@ class AliyunAdapter(BaseAdapter):
     def _parse_stream_chunk(
         self, chunk: dict[str, Any], request_id: str, model: str
     ) -> StreamChunk:
-        """Parse streaming chunk."""
+        """Parse streaming chunk with thinking support."""
         output = chunk.get("output", {})
         choices = output.get("choices", [])
 
         delta = {}
         finish_reason = None
+        thinking_delta = None
 
         if choices:
             choice = choices[0]
@@ -319,12 +357,18 @@ class AliyunAdapter(BaseAdapter):
                 delta["content"] = message["content"]
             finish_reason = choice.get("finish_reason")
 
+        # Extract thinking delta
+        reasoning_content = output.get("reasoning_content")
+        if reasoning_content:
+            thinking_delta = reasoning_content
+
         return StreamChunk(
             id=request_id,
             model=model,
             delta=delta,
             finish_reason=finish_reason,
             provider=self.provider,
+            thinking_delta=thinking_delta,
         )
 
     async def close(self) -> None:

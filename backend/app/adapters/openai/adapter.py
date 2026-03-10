@@ -18,6 +18,10 @@ from app.adapters.base import (
     EmbeddingResponse,
     MessageRole,
     StreamChunk,
+    ThinkingConfig,
+    ThinkingContent,
+    ThinkingEffort,
+    ThinkingMode,
     ToolDefinition,
     Usage,
 )
@@ -38,6 +42,14 @@ OPENAI_MODEL_PREFIXES = [
     "chatgpt-",
     "text-embedding-",
     "text-davinci-",
+]
+
+# Thinking-capable models
+THINKING_MODELS = [
+    "o1-preview",
+    "o1-mini",
+    "o3-mini",
+    "o3",
 ]
 
 
@@ -67,6 +79,11 @@ class OpenAIAdapter(BaseAdapter):
             ),
             max_retries=0,  # We handle retries ourselves
         )
+
+    def _is_thinking_model(self, model: str) -> bool:
+        """Check if model supports thinking/reasoning."""
+        model_lower = model.lower()
+        return any(m in model_lower for m in ["o1", "o3"])
 
     async def chat_completion(
         self, request: ChatCompletionRequest
@@ -103,19 +120,33 @@ class OpenAIAdapter(BaseAdapter):
             if request.tool_choice:
                 request_params["tool_choice"] = request.tool_choice
 
+            # Add thinking/reasoning parameters for supported models
+            if request.thinking and self._is_thinking_model(request.model):
+                thinking_params = request.thinking.to_openai_format()
+                request_params.update(thinking_params)
+
             # Execute request
             response = await self.client.chat.completions.create(**request_params)
 
             # Calculate latency
             latency_ms = (time.time() - start_time) * 1000
 
-            # Build unified response
+            # Build unified response with thinking support
             choices = []
             for idx, choice in enumerate(response.choices):
+                # Extract thinking/reasoning content
+                thinking = None
+                if hasattr(choice.message, 'reasoning_content') and choice.message.reasoning_content:
+                    thinking = ThinkingContent(
+                        content=choice.message.reasoning_content,
+                        metadata={"source": "openai"}
+                    )
+
                 message = ChatMessage(
                     role=MessageRole(choice.message.role),
                     content=choice.message.content or "",
                     tool_calls=self._convert_tool_calls(choice.message.tool_calls),
+                    thinking=thinking,
                 )
                 choices.append(
                     ChatCompletionChoice(
@@ -125,11 +156,8 @@ class OpenAIAdapter(BaseAdapter):
                     )
                 )
 
-            usage = Usage(
-                prompt_tokens=response.usage.prompt_tokens,
-                completion_tokens=response.usage.completion_tokens,
-                total_tokens=response.usage.total_tokens,
-            )
+            # Extract usage with thinking tokens
+            usage = self._extract_usage(response.usage)
 
             return ChatCompletionResponse(
                 id=response.id,
@@ -191,6 +219,11 @@ class OpenAIAdapter(BaseAdapter):
                     tool.to_openai_format() for tool in request.tools
                 ]
 
+            # Add thinking/reasoning parameters for supported models
+            if request.thinking and self._is_thinking_model(request.model):
+                thinking_params = request.thinking.to_openai_format()
+                request_params.update(thinking_params)
+
             # Execute streaming request
             stream = await self.client.chat.completions.create(**request_params)
 
@@ -198,6 +231,7 @@ class OpenAIAdapter(BaseAdapter):
                 delta = {}
                 finish_reason = None
                 usage = None
+                thinking_delta = None
 
                 if chunk.choices:
                     choice = chunk.choices[0]
@@ -218,15 +252,14 @@ class OpenAIAdapter(BaseAdapter):
                                 }
                                 for tc in choice.delta.tool_calls
                             ]
+                        # Extract thinking delta
+                        if hasattr(choice.delta, 'reasoning_content') and choice.delta.reasoning_content:
+                            thinking_delta = choice.delta.reasoning_content
                     if choice.finish_reason:
                         finish_reason = choice.finish_reason
 
                 if chunk.usage:
-                    usage = Usage(
-                        prompt_tokens=chunk.usage.prompt_tokens,
-                        completion_tokens=chunk.usage.completion_tokens,
-                        total_tokens=chunk.usage.total_tokens,
-                    )
+                    usage = self._extract_usage(chunk.usage)
 
                 yield StreamChunk(
                     id=chunk.id or request_id,
@@ -235,6 +268,7 @@ class OpenAIAdapter(BaseAdapter):
                     finish_reason=finish_reason,
                     usage=usage,
                     provider=self.provider,
+                    thinking_delta=thinking_delta,
                 )
 
         except httpx.TimeoutException as e:
@@ -315,6 +349,22 @@ class OpenAIAdapter(BaseAdapter):
             if model_lower.startswith(prefix):
                 return True
         return False
+
+    def _extract_usage(self, usage_obj: Any) -> Usage:
+        """Extract usage including thinking tokens."""
+        reasoning_tokens = None
+
+        # OpenAI returns reasoning_tokens in completion_tokens_details
+        if hasattr(usage_obj, 'completion_tokens_details'):
+            details = usage_obj.completion_tokens_details
+            reasoning_tokens = getattr(details, 'reasoning_tokens', None)
+
+        return Usage(
+            prompt_tokens=usage_obj.prompt_tokens,
+            completion_tokens=usage_obj.completion_tokens,
+            total_tokens=usage_obj.total_tokens,
+            reasoning_tokens=reasoning_tokens,
+        )
 
     def _convert_tool_calls(
         self, tool_calls: list[Any] | None

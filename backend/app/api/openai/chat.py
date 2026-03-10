@@ -17,6 +17,9 @@ from app.adapters import (
     ChatCompletionRequest as AdapterRequest,
     ChatMessage,
     MessageRole,
+    ThinkingConfig,
+    ThinkingEffort,
+    ThinkingMode,
     ToolDefinition,
 )
 from app.api.deps import CurrentContext, DBSession
@@ -184,6 +187,11 @@ async def create_chat_completion(
                 prompt_tokens=response.usage.prompt_tokens,
                 completion_tokens=response.usage.completion_tokens,
                 total_tokens=response.usage.total_tokens,
+                completion_tokens_details={
+                    "reasoning_tokens": response.usage.reasoning_tokens or 0,
+                    "accepted_prediction_tokens": 0,
+                    "rejected_prediction_tokens": 0,
+                } if response.usage.reasoning_tokens else None,
             ),
             system_fingerprint=response.system_fingerprint,
         )
@@ -236,6 +244,7 @@ async def _stream_completion(
                 role=chunk.delta.get("role"),
                 content=chunk.delta.get("content"),
                 tool_calls=chunk.delta.get("tool_calls"),
+                reasoning_content=chunk.thinking_delta,  # Include thinking delta
             )
 
             stream_chunk = ChatCompletionStreamResponse(
@@ -253,6 +262,11 @@ async def _stream_completion(
                     prompt_tokens=chunk.usage.prompt_tokens,
                     completion_tokens=chunk.usage.completion_tokens,
                     total_tokens=chunk.usage.total_tokens,
+                    completion_tokens_details={
+                        "reasoning_tokens": chunk.usage.reasoning_tokens or 0,
+                        "accepted_prediction_tokens": 0,
+                        "rejected_prediction_tokens": 0,
+                    } if chunk.usage.reasoning_tokens else None,
                 ) if chunk.usage else None,
             )
 
@@ -396,6 +410,22 @@ def _build_adapter_request(body: ChatCompletionRequest) -> AdapterRequest:
             for t in body.tools
         ]
 
+    # Build thinking config
+    thinking = None
+    if body.thinking:
+        thinking = ThinkingConfig(
+            mode=ThinkingMode(body.thinking.mode),
+            budget_tokens=body.thinking.budget_tokens,
+            effort=ThinkingEffort(body.thinking.effort) if body.thinking.effort else None,
+            include_thinking=body.thinking.include_thinking,
+        )
+    elif body.reasoning_effort:
+        # Support OpenAI native reasoning_effort parameter
+        thinking = ThinkingConfig(
+            mode=ThinkingMode.ENABLED,
+            effort=ThinkingEffort(body.reasoning_effort),
+        )
+
     return AdapterRequest(
         model=body.model,
         messages=messages,
@@ -409,16 +439,21 @@ def _build_adapter_request(body: ChatCompletionRequest) -> AdapterRequest:
         frequency_penalty=body.frequency_penalty or 0.0,
         presence_penalty=body.presence_penalty or 0.0,
         user=body.user,
+        thinking=thinking,
     )
 
 
 def _convert_message(msg: ChatMessage) -> dict[str, Any]:
     """Convert adapter message to response format."""
-    return {
+    result = {
         "role": msg.role.value,
         "content": msg.content,
         "tool_calls": msg.tool_calls,
     }
+    # Include thinking/reasoning content in response
+    if msg.thinking:
+        result["reasoning_content"] = msg.thinking.content
+    return result
 
 
 def _calculate_cost(

@@ -7,6 +7,24 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
+# ============ Thinking Configuration ============
+
+
+class ThinkingConfigSchema(BaseModel):
+    """Thinking configuration for deep reasoning.
+
+    This provides a unified interface for controlling deep thinking/reasoning
+    across different LLM providers.
+    """
+
+    mode: Literal["enabled", "disabled", "auto"] = "disabled"
+    budget_tokens: int | None = Field(default=None, ge=100, le=100000)
+    effort: Literal["low", "medium", "high"] | None = None
+    include_thinking: bool = True
+
+    model_config = ConfigDict(extra="allow")
+
+
 # ============ Chat Completions ============
 
 
@@ -18,6 +36,7 @@ class ChatCompletionMessage(BaseModel):
     name: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
     tool_call_id: str | None = None
+    reasoning_content: str | None = None  # Thinking/reasoning content (DeepSeek/OpenAI style)
 
 
 class ChatCompletionToolFunction(BaseModel):
@@ -52,6 +71,10 @@ class ChatCompletionRequest(BaseModel):
     n: int | None = Field(default=1, ge=1, le=10)
     user: str | None = None
 
+    # Thinking/reasoning configuration
+    thinking: ThinkingConfigSchema | None = None
+    reasoning_effort: Literal["low", "medium", "high"] | None = None  # OpenAI native
+
     model_config = ConfigDict(extra="allow")  # Allow extra fields for compatibility
 
 
@@ -64,12 +87,21 @@ class ChatCompletionChoice(BaseModel):
     logprobs: dict[str, Any] | None = None
 
 
+class CompletionTokensDetails(BaseModel):
+    """Detailed completion tokens breakdown."""
+
+    reasoning_tokens: int = 0
+    accepted_prediction_tokens: int = 0
+    rejected_prediction_tokens: int = 0
+
+
 class Usage(BaseModel):
     """Token usage information."""
 
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    completion_tokens_details: CompletionTokensDetails | None = None
 
 
 class ChatCompletionResponse(BaseModel):
@@ -95,6 +127,7 @@ class ChatCompletionStreamDelta(BaseModel):
     role: str | None = None
     content: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
+    reasoning_content: str | None = None  # Thinking delta (DeepSeek/OpenAI style)
 
 
 class ChatCompletionStreamChoice(BaseModel):

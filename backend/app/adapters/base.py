@@ -15,6 +15,87 @@ class MessageRole(StrEnum):
     TOOL = "tool"
 
 
+class ThinkingMode(StrEnum):
+    """Thinking mode options for deep reasoning."""
+
+    ENABLED = "enabled"
+    DISABLED = "disabled"
+    AUTO = "auto"  # Let provider decide
+
+
+class ThinkingEffort(StrEnum):
+    """Reasoning effort levels (OpenAI style)."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+@dataclass
+class ThinkingConfig:
+    """Unified thinking/reasoning configuration.
+
+    This provides a unified interface for controlling deep thinking/reasoning
+    across different LLM providers.
+    """
+
+    mode: ThinkingMode = ThinkingMode.DISABLED
+    budget_tokens: int | None = None  # For Anthropic-style providers
+    effort: ThinkingEffort | None = None  # For OpenAI-style providers
+    include_thinking: bool = True  # Return thinking content in response
+    provider_params: dict[str, Any] = field(default_factory=dict)
+
+    def to_openai_format(self) -> dict[str, Any]:
+        """Convert to OpenAI o1/o3 format."""
+        params = {}
+        if self.effort:
+            params["reasoning_effort"] = self.effort.value
+        return params
+
+    def to_anthropic_format(self) -> dict[str, Any]:
+        """Convert to Anthropic Claude format."""
+        if self.mode == ThinkingMode.DISABLED:
+            return {}
+        return {
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": self.budget_tokens or 10000,
+            }
+        }
+
+    def to_deepseek_format(self) -> dict[str, Any]:
+        """Convert to DeepSeek R1 format."""
+        return {
+            "thinking": {
+                "type": "enabled" if self.mode == ThinkingMode.ENABLED else "disabled"
+            }
+        }
+
+    def to_aliyun_format(self) -> dict[str, Any]:
+        """Convert to Aliyun Qwen format."""
+        return {
+            "enable_thinking": self.mode == ThinkingMode.ENABLED
+        }
+
+    def to_zhipu_format(self) -> dict[str, Any]:
+        """Convert to Zhipu GLM format."""
+        return {
+            "thinking": {
+                "type": "enabled" if self.mode == ThinkingMode.ENABLED else "disabled"
+            }
+        }
+
+
+@dataclass
+class ThinkingContent:
+    """Represents thinking/reasoning content in responses."""
+
+    content: str  # The actual thinking content
+    tokens: int | None = None  # Token count for thinking (if available)
+    signature: str | None = None  # Signature for verification (Anthropic)
+    metadata: dict[str, Any] = field(default_factory=dict)  # Provider-specific metadata
+
+
 @dataclass
 class ChatMessage:
     """Unified chat message representation."""
@@ -24,6 +105,7 @@ class ChatMessage:
     name: str | None = None
     tool_calls: list[dict[str, Any]] | None = None
     tool_call_id: str | None = None
+    thinking: ThinkingContent | None = None  # Thinking/reasoning content
 
     def to_openai_format(self) -> dict[str, Any]:
         """Convert to OpenAI message format."""
@@ -34,6 +116,9 @@ class ChatMessage:
             msg["tool_calls"] = self.tool_calls
         if self.tool_call_id:
             msg["tool_call_id"] = self.tool_call_id
+        # Include thinking content as reasoning_content for OpenAI compatibility
+        if self.thinking:
+            msg["reasoning_content"] = self.thinking.content
         return msg
 
     def to_anthropic_format(self) -> dict[str, Any]:
@@ -99,6 +184,7 @@ class ChatCompletionRequest:
     presence_penalty: float = 0.0
     user: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    thinking: ThinkingConfig | None = None  # Thinking/reasoning configuration
 
 
 @dataclass
@@ -118,13 +204,23 @@ class Usage:
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    reasoning_tokens: int | None = None  # Tokens used for thinking/reasoning
+    metadata: dict[str, Any] = field(default_factory=dict)  # Additional usage metadata
 
-    def to_openai_format(self) -> dict[str, int]:
-        return {
+    def to_openai_format(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.total_tokens,
         }
+        # Include reasoning tokens in OpenAI format
+        if self.reasoning_tokens is not None:
+            result["completion_tokens_details"] = {
+                "reasoning_tokens": self.reasoning_tokens,
+                "accepted_prediction_tokens": 0,
+                "rejected_prediction_tokens": 0,
+            }
+        return result
 
     def to_anthropic_format(self) -> dict[str, int]:
         return {
@@ -194,9 +290,16 @@ class StreamChunk:
     finish_reason: str | None = None
     usage: Usage | None = None
     provider: str = "unknown"
+    thinking_delta: str | None = None  # Thinking content delta for streaming
+    thinking_usage: Usage | None = None  # Thinking tokens usage (separate from output)
 
     def to_openai_format(self) -> dict[str, Any]:
         """Convert to OpenAI streaming format."""
+        # Include thinking delta in the response
+        delta = dict(self.delta)
+        if self.thinking_delta:
+            delta["reasoning_content"] = self.thinking_delta
+
         chunk: dict[str, Any] = {
             "id": self.id,
             "object": "chat.completion.chunk",
@@ -205,7 +308,7 @@ class StreamChunk:
             "choices": [
                 {
                     "index": 0,
-                    "delta": self.delta,
+                    "delta": delta,
                     "finish_reason": self.finish_reason,
                 }
             ],

@@ -19,6 +19,9 @@ from app.adapters.base import (
     EmbeddingResponse,
     MessageRole,
     StreamChunk,
+    ThinkingConfig,
+    ThinkingContent,
+    ThinkingMode,
     ToolDefinition,
     Usage,
 )
@@ -35,12 +38,26 @@ ANTHROPIC_MODEL_PREFIXES = [
     "claude3-",
 ]
 
+# Extended thinking capable models
+EXTENDED_THINKING_MODELS = [
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5",
+    "claude-sonnet-4",
+    "claude-opus-4-5",
+    "claude-opus-4-1",
+    "claude-opus-4",
+    "claude-haiku-4-5",
+    "claude-3-7-sonnet",
+    "claude-3-5-sonnet",
+]
+
 
 @register_adapter(Provider.ANTHROPIC)
 class AnthropicAdapter(BaseAdapter):
     """Anthropic API adapter supporting Claude models.
 
     Handles conversion between OpenAI-compatible and Anthropic formats.
+    Supports extended thinking for Claude 4.x models.
     """
 
     provider = "anthropic"
@@ -65,6 +82,11 @@ class AnthropicAdapter(BaseAdapter):
             ),
             max_retries=0,
         )
+
+    def _is_extended_thinking_model(self, model: str) -> bool:
+        """Check if model supports extended thinking."""
+        model_lower = model.lower()
+        return any(m in model_lower for m in ["claude-4", "claude-3-7", "claude-3-5"])
 
     async def chat_completion(
         self, request: ChatCompletionRequest
@@ -98,6 +120,12 @@ class AnthropicAdapter(BaseAdapter):
                 request_params["tools"] = [
                     tool.to_anthropic_format() for tool in request.tools
                 ]
+
+            # Add extended thinking parameters for supported models
+            if request.thinking and request.thinking.mode == ThinkingMode.ENABLED:
+                if self._is_extended_thinking_model(request.model):
+                    thinking_params = request.thinking.to_anthropic_format()
+                    request_params.update(thinking_params)
 
             # Execute request
             response = await self.client.messages.create(**request_params)
@@ -154,6 +182,12 @@ class AnthropicAdapter(BaseAdapter):
                 request_params["tools"] = [
                     tool.to_anthropic_format() for tool in request.tools
                 ]
+
+            # Add extended thinking parameters for supported models
+            if request.thinking and request.thinking.mode == ThinkingMode.ENABLED:
+                if self._is_extended_thinking_model(request.model):
+                    thinking_params = request.thinking.to_anthropic_format()
+                    request_params.update(thinking_params)
 
             # Execute streaming request
             async with self.client.messages.stream(**request_params) as stream:
@@ -308,13 +342,20 @@ class AnthropicAdapter(BaseAdapter):
     def _convert_response(
         self, response: AnthropicMessage, model: str, latency_ms: float
     ) -> ChatCompletionResponse:
-        """Convert Anthropic response to unified format."""
-        # Extract content
+        """Convert Anthropic response to unified format with thinking support."""
         text_content = ""
+        thinking_content = None
         tool_calls = []
 
         for block in response.content:
-            if block.type == "text":
+            if block.type == "thinking":
+                # Extract thinking block
+                thinking_content = ThinkingContent(
+                    content=block.thinking,
+                    signature=getattr(block, 'signature', None),
+                    metadata={"source": "anthropic"}
+                )
+            elif block.type == "text":
                 text_content += block.text
             elif block.type == "tool_use":
                 tool_calls.append({
@@ -330,6 +371,7 @@ class AnthropicAdapter(BaseAdapter):
             role=MessageRole.ASSISTANT,
             content=text_content,
             tool_calls=tool_calls if tool_calls else None,
+            thinking=thinking_content,
         )
 
         choice = ChatCompletionChoice(
@@ -344,6 +386,13 @@ class AnthropicAdapter(BaseAdapter):
             total_tokens=response.usage.input_tokens + response.usage.output_tokens,
         )
 
+        # Extract cache usage if available
+        if hasattr(response.usage, 'cache_read_input_tokens'):
+            usage.metadata = {
+                "cache_read_tokens": response.usage.cache_read_input_tokens,
+                "cache_write_tokens": getattr(response.usage, 'cache_write_input_tokens', 0),
+            }
+
         return ChatCompletionResponse(
             id=response.id,
             model=response.model,
@@ -357,46 +406,57 @@ class AnthropicAdapter(BaseAdapter):
     def _convert_stream_event(
         self, event: Any, request_id: str, model: str
     ) -> StreamChunk | None:
-        """Convert Anthropic stream event to unified chunk format."""
+        """Convert Anthropic stream event to unified chunk format with thinking support."""
         event_type = getattr(event, "type", None)
 
         if event_type == "content_block_delta":
             delta = event.delta
-            if hasattr(delta, "type") and delta.type == "text_delta":
-                return StreamChunk(
-                    id=request_id,
-                    model=model,
-                    delta={"content": delta.text},
-                    provider=self.provider,
-                )
-            elif hasattr(delta, "type") and delta.type == "input_json_delta":
-                # Tool use partial
-                return StreamChunk(
-                    id=request_id,
-                    model=model,
-                    delta={
-                        "tool_calls": [{
-                            "function": {"arguments": delta.partial_json},
-                        }]
-                    },
-                    provider=self.provider,
-                )
+            if hasattr(delta, "type"):
+                if delta.type == "thinking_delta":
+                    # Thinking delta
+                    return StreamChunk(
+                        id=request_id,
+                        model=model,
+                        delta={},
+                        thinking_delta=delta.thinking,
+                        provider=self.provider,
+                    )
+                elif delta.type == "text_delta":
+                    return StreamChunk(
+                        id=request_id,
+                        model=model,
+                        delta={"content": delta.text},
+                        provider=self.provider,
+                    )
+                elif delta.type == "input_json_delta":
+                    # Tool use partial
+                    return StreamChunk(
+                        id=request_id,
+                        model=model,
+                        delta={
+                            "tool_calls": [{
+                                "function": {"arguments": delta.partial_json},
+                            }]
+                        },
+                        provider=self.provider,
+                    )
 
         elif event_type == "content_block_start":
             block = event.content_block
-            if hasattr(block, "type") and block.type == "tool_use":
-                return StreamChunk(
-                    id=request_id,
-                    model=model,
-                    delta={
-                        "tool_calls": [{
-                            "id": block.id,
-                            "type": "function",
-                            "function": {"name": block.name, "arguments": ""},
-                        }]
-                    },
-                    provider=self.provider,
-                )
+            if hasattr(block, "type"):
+                if block.type == "tool_use":
+                    return StreamChunk(
+                        id=request_id,
+                        model=model,
+                        delta={
+                            "tool_calls": [{
+                                "id": block.id,
+                                "type": "function",
+                                "function": {"name": block.name, "arguments": ""},
+                            }]
+                        },
+                        provider=self.provider,
+                    )
 
         return None
 
