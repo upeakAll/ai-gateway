@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-gateway
+  labels:
+    app: ai-gateway
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ai-gateway
+  template:
+    metadata:
+      labels:
+        app: ai-gateway
+    spec:
+      containers:
+        - name: backend
+          image: ai-gateway:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ai-gateway-secrets
+                  key: database-url
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ai-gateway-secrets
+                  key: redis-url
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ai-gateway-secrets
+                  key: secret-key
+            - name: ENVIRONMENT
+              value: "production"
+            - name: DEBUG
+              value: "false"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: ai-gateway-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-gateway-config
+data:
+  # Non-sensitive configuration
+  LOG_LEVEL: "INFO"
+  LOG_FORMAT: "json"
+  METRICS_ENABLED: "true"
+  RATE_LIMIT_ENABLED: "true"
+  RATE_LIMIT_DEFAULT_RPM: "60"
+  RATE_LIMIT_DEFAULT_TPM: "100000"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ai-gateway-secrets
+type: Opaque
+stringData:
+  database-url: "postgresql+asyncpg://postgres:postgres@postgres:5432/ai_gateway"
+  redis-url: "redis://redis:6379/0"
+  secret-key: "change-me-in-production-with-secure-random-key"
